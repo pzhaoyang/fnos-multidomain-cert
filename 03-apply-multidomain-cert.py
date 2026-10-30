@@ -604,7 +604,9 @@ class FnosCert:
 
 # ---------------- 种子证书 ----------------
 def gen_seed_cert(domains):
-    cn = domains[0]
+    # CN 要用**非通配符**域名：fnOS 把 CN 当证书主域名（cert.list 的 domain 字段），
+    # 续签时拿它跟 DDNS 记录的 domain 比对；CN 是 *.x 会判 Domain Not Match（3000033）
+    cn = next((d for d in domains if not d.startswith("*.")), domains[0])
     san_ext = ",".join(f"DNS:{d}" for d in domains)
     work = tempfile.mkdtemp(prefix="fnos-seed-")
     crt = os.path.join(work, "seed.crt")
@@ -692,9 +694,11 @@ def list_ddns(api):
 def print_ddns(rows):
     print(f"      共 {len(rows)} 条 DDNS 记录（-r 用 id）：")
     for e in rows:
+        txt = e.get("providerSupportTxt")
+        txt_flag = "" if txt is None else ("  TXT✓" if int(txt) else "  TXT✗(不能签证书)")
         print(f"        id={str(e.get('id')):<4} "
               f"{(e.get('providerAlias') or e.get('provider') or ''):<12} "
-              f"{e.get('domain', '')}")
+              f"{e.get('domain', '')}{txt_flag}")
 
 
 def resolve_ddns_id(api, domains, want_id=None):
@@ -910,7 +914,7 @@ def main():
         others = ", ".join(str(e["id"]) for e in same if e["id"] != entry["id"])
         print(f"      提示：有 {len(same)} 条同名证书，本次用 id={entry['id']}；"
               f"历史遗留 id={others} 可在网页「安全性→证书」里删掉")
-    print(f"      id={entry['id']}  SAN={entry.get('SAN', '')}")
+    print(f"      id={entry['id']}  域名(CN)={entry.get('domain', '')}  SAN={entry.get('SAN', '')}")
 
     print(f"[5/7] cert.replace 赋予续签资格 (renewal:1 + relatedDDNSId={ddns_id})...")
     api.must(api.call("appcgi.netsvr.cert.replace", {
@@ -927,6 +931,13 @@ def main():
         if "3000034" in str(e):
             sys.exit(f"{e}\n  提示：这是 DDNS 记录 id 不对。用 --list-ddns 看可用 id，"
                      f"或直接不写 -r 让脚本自动匹配。")
+        if "3000033" in str(e):
+            sys.exit(f"{e}\n"
+                     f"  提示：证书的「域名」与 DDNS 记录的 domain 对不上。\n"
+                     f"    本次证书域名(CN) = {entry.get('domain', '')}，"
+                     f"应等于所选 DDNS 记录的 domain。\n"
+                     f"    用 --list-ddns 核对；若是通配符证书，"
+                     f"优先选 domain 为 *.你的域名 或 主域名的记录。")
         raise
     print(f"      processId={proc}")
 

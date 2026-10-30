@@ -188,7 +188,7 @@ python3 03-apply-multidomain-cert.py --test
 | `errno 65534`（验签失败） | 已连上但会话未绑定 | 改用 Cookie 方式，且 `FNOS_COOKIE` 要取**完整**整行 |
 | `errno 8192` / `3000001` | 参数格式不对 | 确认 `deviceType` 为字符串 `Browser`；2FA 字段不要缺 |
 | `3000034 Cert Apply DDNS Record Not Found` | `-r` 指向的 DDNS 记录不存在 | 省略 `-r` 让脚本自动匹配，或 `--list-ddns` 查真实 id |
-| `3000033 Cert Apply Domain Not Match` | 域名与 DDNS 记录不同区 | 换 `-r`，或省略让脚本自动匹配 |
+| `3000033 Cert Apply Domain Not Match` | 证书主域名（CN）与 DDNS 记录的 domain 对不上 | 脚本已保证 CN 用非通配符域名；仍报错就 `--list-ddns` 换 `-r` |
 | `3000035 Cert Not Renewable` | 条目丢了续签资格 | 脚本已在 `cert.replace` 带 `renewal:1`，无需手动处理 |
 | `Certificate bundle starts with a CA certificate` | 种子证书是 CA:TRUE | 脚本已用 `CA:FALSE` 生成，无需手动处理 |
 

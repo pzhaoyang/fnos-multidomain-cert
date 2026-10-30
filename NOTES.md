@@ -320,6 +320,21 @@ frame = base64( HMAC-SHA256( json, secret_bytes ) ) + json
 - 教训：**能自测的就别让用户填**。同理，用户名/密码/访问码/2FA 也都改成
   「环境变量优先，缺了就交互提示」，非交互环境才报错要求设变量
 
+### 坑 17：`3000033 Domain Not Match` —— CN 不能是通配符
+- 现象：`-d '*.wmedia.example.com,wmedia.example.com'`（**通配符在前**），
+  上传、replace 都成功，renew 报 `3000033 Cert Apply Domain Not Match`；
+  而同样的配方在另一台机器上（非通配符在前）却能签下来
+- 根因：fnOS 把证书的 **CN 当作主域名**（`cert.list` 里的 `domain` 字段），
+  续签时拿它和所选 DDNS 记录的 `domain` 比对。CN 是 `*.zone` 时
+  ≠ 记录的 `zone`，于是判不匹配
+- 对照证据：成功那张证书 `cert.list` 记录里 `domain=imedia.example.com`、
+  `SAN=*.imedia.example.com,imedia.example.com` —— 主域名非通配符、SAN 含通配符
+- 修复：生成种子证书时 **CN 取第一个非通配符域名**，SAN 仍包含全部域名
+  （`openssl req -subj /CN=...` 用 `next(d for d in domains if not d.startswith("*."))`）
+- 顺带：`--list-ddns` 现在会标 `TXT✓ / TXT✗`，DNS-01 必须用支持 TXT 的记录
+- 排查顺序速记：`3000034` = 记录 id 不存在 → `3000033` = 域名与记录 domain 不匹配
+  → `3000035` = 记录存在但条目没续签资格（replace 没带 renewal:1）
+
 ---
 
 ## 五、DDNS 记录与 relatedDDNSId（实测，重要）
