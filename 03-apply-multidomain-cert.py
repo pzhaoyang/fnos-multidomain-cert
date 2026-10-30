@@ -14,6 +14,7 @@
     # 方式 A（推荐）：密码自动登录，完全自动化
     export FNOS_USER='你的用户名'
     export FNOS_PASS='你的密码'
+    export FNOS_WS_PORT='5667'          # 按需：改过 HTTPS 端口才需要
     python3 03-apply-multidomain-cert.py --test
     python3 03-apply-multidomain-cert.py -d "example.com,*.example.com" -r 1
 
@@ -22,10 +23,19 @@
     export FNOS_COOKIE='<Cookie 请求头整行>'
     python3 03-apply-multidomain-cert.py --test
 
+按需追加的环境变量：
+    export FNOS_ACCESS_CODE='你的访问码'   # NAS 开了「访问码/访问保护」时
+    export FNOS_2FA_CODE='123456'         # 账号开了「双重验证」时，30 秒内有效
+
 如果 NAS 开启了「访问码（访问保护）」，握手会在 nginx 层被 401 拦下
 （响应头 X-Trim-Safe-Code-Challenge: 1）。此时再补一个环境变量即可：
     export FNOS_ACCESS_CODE='你的访问码'
 脚本会先调用 /access_code_verify 换取会话 Cookie，再建立 WS 连接。
+
+如果账号开启了「双重验证（2FA）」，登录只返回 accessToken、不返回 secret，
+此时需再补：
+    export FNOS_2FA_CODE='验证器里的 6 位码'
+脚本会自动补一步 user.2fa.loginVerify 换取 secret，然后照常签发。
 
 协议要点（全部实测得出）：
     - 密码登录：getRSAPub → RSA-OAEP-SHA256 加密随机 AES-256 密钥 →
