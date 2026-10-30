@@ -22,16 +22,16 @@ export FNOS_USER='你的用户名'
 export FNOS_PASS='你的网页登录密码'
 # 仅当 NAS 开了「访问码」时才需要（见坑 13）；没开就别设
 export FNOS_ACCESS_CODE='你的访问码'
-# 仅当账号开了 2FA 时才需要（见坑 14），填验证器当前的 6 位码
-export FNOS_2FA_CODE='验证器里的 6 位数字'
 
 # 先测连通（会真实登录一次 + 列出所有证书）
 python3 03-apply-multidomain-cert.py --test
 
-# 正式申请一张多域名证书
+# 先看有哪些 DDNS 记录（-r 用这里的 id；也可以不给 -r 让它自动匹配）
+python3 03-apply-multidomain-cert.py --list-ddns
+
+# 正式申请一张多域名证书（2FA 会提示输入；不写 -r 则按域名自动匹配）
 python3 03-apply-multidomain-cert.py \
-  -d "example.com,*.example.com,www.example.com" \
-  -r 1
+  -d "example.com,*.example.com,www.example.com"
 ```
 
 参数说明：
@@ -39,10 +39,15 @@ python3 03-apply-multidomain-cert.py \
 | 参数 | 含义 | 默认 |
 |---|---|---|
 | `-d` / `--domains` | 逗号分隔的域名列表（可含通配符 `*.x`） | 必填 |
-| `-r` / `--related-ddns-id` | DDNS 记录 id（提供 DNS-01 解析商凭证） | 1 |
+| `-r` / `--related-ddns-id` | DDNS 记录 id（提供 DNS-01 解析商凭证） | 留空自动匹配，且上传前校验存在 |
 | `-s` / `--server` | WS 地址，留空自动探测 | 本机 HTTPS 端口（`FNOS_WS_PORT` 可指定，默认 5667） |
 | `--desc` | 证书备注 | multidomain-cert |
 | `--test` | 只登录 + 列证书，不做任何写操作 | — |
+| `--list-ddns` | 只列 DDNS 记录后退出 | — |
+
+环境变量（按需，见 [ENV.md](ENV.md)）：
+`FNOS_USER` / `FNOS_PASS` / `FNOS_WS_PORT` / `FNOS_ACCESS_CODE` / `FNOS_2FA_CODE` /
+`FNOS_SECRET` / `FNOS_COOKIE`。2FA 不设也行，脚本会提示输入。
 
 依赖：`python3`（标准库）+ `openssl`（都是 fnOS 自带）。
 
@@ -274,6 +279,28 @@ frame = base64( HMAC-SHA256( json, secret_bytes ) ) + json
 - 与自动化冲突：验证码 30 秒过期，不能放进 cron。但因为 fnOS 会自己按
   `renewal:1` 续签，本脚本只在「新签」时跑一次，所以可接受
   （要彻底免验证码，可以存 TOTP 密钥自己算码，或复用受信设备的 `did`）
+- 体验修正：**不要逼用户去 export 环境变量**。脚本改成在需要时直接
+  `input()` 提示输入，输错/过期可重试 3 次；`FNOS_2FA_CODE` 只在
+  非交互场景（脚本编排、管道）才需要。实践反馈：`export` 一次再用一次
+  几乎必然踩到 30 秒窗口，体验极差
+
+### 坑 15：`3000034 Cert Apply DDNS Record Not Found` —— `-r` 是机器相关的
+- 现象：换一台 NAS 沿用 `-r 1`，前面 upload/replace 全部成功，走到 `cert.renew` 才炸：
+  ```
+  RuntimeError: cert.renew 失败: 3000034 Cert Apply DDNS Record Not Found
+  ```
+- 根因：`relatedDDNSId` 是 `d_dns_record` 表的**自增 id，因机器而异**。
+  旧机器上 id=1 是主域名记录，新机器上 id=1 可能完全不存在
+- 更糟的是：`cert.replace` 阶段**不校验**这个 id，所以会先白白上传一张自签种子证书，
+  在证书列表里留下一条没用的条目，等 renew 才报错
+- 正确做法：
+  1. 用 `appcgi.netsvr.ddns.record.list` 拿到真实记录（返回 `data.list[]`，
+     字段 `id / domain / provider / providerAlias / providerSupportTxt`）
+  2. **上传前**就校验 `-r` 是否存在，不存在立刻停，不浪费一次上传
+  3. 没给 `-r` 时按域名后缀自动匹配：把请求域名和记录 `domain` 都去掉 `*.`，
+     取「记录域名是请求域名后缀」里最长的那条（同区即可，Cloudflare token 按 zone 通用）
+- 注意区分：`3000033 Domain Not Match`（域名与记录不同区）
+  vs `3000034 DDNS Record Not Found`（记录 id 根本不存在）
 
 ---
 

@@ -497,15 +497,115 @@ def gen_seed_cert(domains):
 
 
 # ---------------- 主流程 ----------------
+# ---------------- 2FA 交互 ----------------
+def ask_twofa(api, initial=""):
+    """获取并提交 2FA 验证码。
+
+    优先用 FNOS_2FA_CODE；没有则交互提示（终端里直接运行即可）。
+    验证码输错/过期允许重输，最多 3 次——因为 30 秒窗口很容易卡在“手慢”上。
+    """
+    code = (initial or "").strip()
+    for attempt in range(1, 4):
+        if not code:
+            if not sys.stdin.isatty():
+                sys.exit(
+                    "需要 2FA 验证码，但当前不是交互终端（stdin 不是终端）。\n"
+                    "  请在终端里直接运行本脚本，或 export FNOS_2FA_CODE='6 位码' 后重跑。"
+                )
+            try:
+                code = input("      请输入验证器 App 当前的 6 位验证码: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit("\n已取消")
+            if not code:
+                continue
+        try:
+            api.twofa_verify(code)
+            return True
+        except RuntimeError as e:
+            msg = str(e)
+            if "135168" not in msg:
+                raise
+            if attempt == 3:
+                sys.exit(f"2FA 验证连续失败 3 次：{e}")
+            print(f"      ✗ 验证码不正确或已过期，请重新输入（{attempt}/3）")
+            code = ""
+            time.sleep(1)
+    return False
+
+
+# ---------------- DDNS 记录解析 ----------------
+def list_ddns(api):
+    """列出 NAS 上的 DDNS 记录（DNS-01 用的解析商凭证）"""
+    data = api.must(api.call("appcgi.netsvr.ddns.record.list"), "ddns.record.list") or {}
+    return data.get("list") or []
+
+
+def print_ddns(rows):
+    print(f"      共 {len(rows)} 条 DDNS 记录（-r 用 id）：")
+    for e in rows:
+        print(f"        id={str(e.get('id')):<4} "
+              f"{(e.get('providerAlias') or e.get('provider') or ''):<12} "
+              f"{e.get('domain', '')}")
+
+
+def resolve_ddns_id(api, domains, want_id=None):
+    """确定 relatedDDNSId。
+
+    - 显式给 -r：先校验它真实存在。否则要走到 cert.renew 才报 3000034，
+      还会在证书列表里留下一条没用的自签条目。
+    - 没给 -r：按域名后缀自动挑最长匹配的那条 DDNS 记录。
+    """
+    rows = list_ddns(api)
+    if not rows:
+        raise RuntimeError("NAS 上没有任何 DDNS 记录，无法提供 DNS-01 解析凭证；"
+                           "请先在 fnOS 网页里配置 DDNS（需支持 TXT 记录）")
+
+    if want_id is not None:
+        if any(str(e.get("id")) == str(want_id) for e in rows):
+            return int(want_id)
+        print(f"      ✗ -r {want_id} 不存在，不会浪费一次上传")
+        print_ddns(rows)
+        raise RuntimeError(f"DDNS 记录 id={want_id} 不存在"
+                           "（继续下去 cert.renew 会报 3000034 Cert Apply DDNS Record Not Found）")
+
+    # 自动匹配：请求域名去掉通配符后，找 domain 为其后缀的最长记录
+    best, best_len = None, -1
+    for e in rows:
+        rec = str(e.get("domain") or "").lower()
+        rec = rec[2:] if rec.startswith("*.") else rec
+        rec = rec.strip(".")
+        if not rec:
+            continue
+        for d in domains:
+            dd = d.lower()
+            dd = dd[2:] if dd.startswith("*.") else dd
+            dd = dd.strip(".")
+            if dd == rec or dd.endswith("." + rec):
+                if len(rec) > best_len:
+                    best, best_len = e, len(rec)
+                break
+
+    if best is None:
+        print("      ✗ 没有与请求域名同区的 DDNS 记录")
+        print_ddns(rows)
+        raise RuntimeError("找不到匹配的 DDNS 记录，请用 -r 手动指定上面的某个 id")
+
+    print(f"      自动选用 DDNS 记录 id={best.get('id')} ({best.get('domain')})")
+    return int(best.get("id"))
+
+
+# ---------------- 主流程 ----------------
 def main():
     ap = argparse.ArgumentParser(description="fnOS 多域名证书申请（一张证书覆盖多域名 + 通配符）")
     ap.add_argument("-d", "--domains", help="逗号分隔的域名列表（可含通配符）")
-    ap.add_argument("-r", "--related-ddns-id", type=int, default=1,
-                    help="DDNS 记录 id（DNS-01 解析商凭证），默认 1")
+    ap.add_argument("-r", "--related-ddns-id", type=int, default=None,
+                    help="DDNS 记录 id（DNS-01 的解析商凭证）；留空自动按域名匹配，见 --list-ddns")
     ap.add_argument("-s", "--server", default="",
                     help="WS 地址；留空自动探测本机 HTTPS 端口（FNOS_WS_PORT 可指定端口，默认 5667）")
     ap.add_argument("--desc", default="multidomain-cert", help="证书备注（≤32 字符）")
     ap.add_argument("--test", action="store_true", help="只测连通性（列证书，不写任何东西）")
+    ap.add_argument("--list-ddns", action="store_true",
+                    help="只列出 DDNS 记录 id 与域名（然后退出）")
     args = ap.parse_args()
 
     username = os.environ.get("FNOS_USER", "").rstrip("\r\n")
@@ -519,14 +619,10 @@ def main():
     if not use_password and not secret:
         sys.exit("错误：请设置 FNOS_USER+FNOS_PASS（自动登录），或 FNOS_SECRET（手动从浏览器取）")
 
-    if not args.test and not args.domains:
-        sys.exit("错误：-d 必填（逗号分隔域名列表），或用 --test 只测连通")
+    only_query = args.test or args.list_ddns
+    if not only_query and not args.domains:
+        sys.exit("错误：-d 必填（逗号分隔域名列表），或用 --test / --list-ddns 只看不改")
     domains = [x.strip() for x in (args.domains or "").split(",") if x.strip()]
-
-    cert_b64 = key_b64 = ""
-    if not args.test:
-        print(f"[1/6] 生成多 SAN 种子证书（{','.join(domains)}）...")
-        cert_b64, key_b64 = gen_seed_cert(domains)
 
     # 连接（自动探测端点——可用 FNOS_WS_PORT 指定端口，默认 fnOS 系统 HTTPS 端口）
     candidates = [args.server] if args.server else DEFAULT_CANDIDATES
@@ -534,7 +630,7 @@ def main():
     for u in candidates:
         try:
             api = FnosCert(u, secret if not use_password else "", cookie, access_code)
-            print("[0/6] WS 已连接:", u)
+            print("[0] WS 已连接:", u)
             if use_password:
                 print("      密码自动登录中...")
                 try:
@@ -542,13 +638,7 @@ def main():
                 except TwofaRequired as e:
                     api.access_token = e.access_token
                     print("      该账号开启了双重验证（2FA）")
-                    if not twofa_code:
-                        sys.exit(
-                            "需要 2FA 验证码：请 export FNOS_2FA_CODE='验证器里的 6 位数字' 后重跑。\n"
-                            "  （验证码 30 秒内有效，所以脚本一次跑完：登录 → 提交验证码 → 调接口）"
-                        )
-                    print("      提交验证码...")
-                    api.twofa_verify(twofa_code)
+                    ask_twofa(api, twofa_code)
                 print(f"      登录成功 uid={api.login_uid} admin={api.login_admin}")
             break
         except Exception as e:
@@ -561,40 +651,63 @@ def main():
     if not use_password:
         api.handshake()
 
+    if args.list_ddns:
+        print_ddns(list_ddns(api))
+        return
+
     if args.test:
         rows = api.must(api.call("appcgi.netsvr.cert.list"), "cert.list")
         print(f"连通性 OK，共 {len(rows)} 张证书：")
         for e in rows:
-            print(f"  id={e['id']:<3} issuedBy={e.get('issuedBy', ''):<28} SAN={e.get('SAN', '')}")
+            print(f"  id={str(e['id']):<3} issuedBy={e.get('issuedBy', ''):<28} SAN={e.get('SAN', '')}")
         return
 
-    print("[2/6] cert.upload 导入种子证书...")
+    print("[1/7] 解析 DDNS 记录（DNS-01 凭证）...")
+    ddns_id = resolve_ddns_id(api, domains, args.related_ddns_id)
+
+    print(f"[2/7] 生成多 SAN 种子证书（{','.join(domains)}）...")
+    cert_b64, key_b64 = gen_seed_cert(domains)
+
+    print("[3/7] cert.upload 导入种子证书...")
     api.must(api.call("appcgi.netsvr.cert.upload", {
         "privateKeyBase64": key_b64, "certificateBase64": cert_b64,
         "issuerCertificateBase64": "", "desc": args.desc, "isDefault": 0,
         "privateKeyPath": "", "certificatePath": "", "issuerCertificatePath": "",
     }), "cert.upload")
 
-    print("[3/6] 定位新条目 id...")
+    print("[4/7] 定位新条目 id...")
     rows = api.must(api.call("appcgi.netsvr.cert.list"), "cert.list")
-    entry = next((e for e in rows if e.get("desc") == args.desc), None)
-    if not entry:
+    same = [e for e in rows if e.get("desc") == args.desc]
+    if not same:
         sys.exit(f"未在列表中找到 desc={args.desc} 的新条目")
+    # 同名条目可能有历史遗留（比如上次 -r 写错：上传成功但 renew 失败），
+    # 取 id 最大的那条 = 本次刚上传的
+    entry = max(same, key=lambda e: e["id"])
+    if len(same) > 1:
+        others = ", ".join(str(e["id"]) for e in same if e["id"] != entry["id"])
+        print(f"      提示：有 {len(same)} 条同名证书，本次用 id={entry['id']}；"
+              f"历史遗留 id={others} 可在网页「安全性→证书」里删掉")
     print(f"      id={entry['id']}  SAN={entry.get('SAN', '')}")
 
-    print(f"[4/6] cert.replace 赋予续签资格 (renewal:1 + relatedDDNSId={args.related_ddns_id})...")
+    print(f"[5/7] cert.replace 赋予续签资格 (renewal:1 + relatedDDNSId={ddns_id})...")
     api.must(api.call("appcgi.netsvr.cert.replace", {
         "privateKeyBase64": key_b64, "certificateBase64": cert_b64,
         "issuerCertificateBase64": "", "desc": args.desc, "id": entry["id"], "isDefault": 0,
         "privateKeyPath": "", "certificatePath": "", "issuerCertificatePath": "",
-        "renewal": 1, "relatedDDNSId": args.related_ddns_id,   # ← 关键：这两个字段
+        "renewal": 1, "relatedDDNSId": ddns_id,   # ← 关键：这两个字段
     }), "cert.replace")
 
-    print("[5/6] cert.renew 触发 fnOS ACME 签发...")
-    proc = api.must(api.call("appcgi.netsvr.cert.renew", {"id": entry["id"]}), "cert.renew")
+    print("[6/7] cert.renew 触发 fnOS ACME 签发...")
+    try:
+        proc = api.must(api.call("appcgi.netsvr.cert.renew", {"id": entry["id"]}), "cert.renew")
+    except RuntimeError as e:
+        if "3000034" in str(e):
+            sys.exit(f"{e}\n  提示：这是 DDNS 记录 id 不对。用 --list-ddns 看可用 id，"
+                     f"或直接不写 -r 让脚本自动匹配。")
+        raise
     print(f"      processId={proc}")
 
-    print("[6/6] 轮询签发任务（DNS-01，通常 20~90 秒）...")
+    print("[7/7] 轮询签发任务（DNS-01，通常 20~90 秒）...")
     for _ in range(36):
         time.sleep(5)
         st = api.must(api.call("appcgi.netsvr.cert.applystatus", {"processId": proc}), "applystatus")
@@ -620,6 +733,10 @@ def main():
     print(f"  renewal  = {final.get('renewal')}   (1=fnOS 自动续签)")
     print("可在 fnOS 网页「安全性→证书→服务配置」把新证书绑定到反向代理等服务。")
 
-
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as e:
+        sys.exit(f"错误: {e}")
+    except KeyboardInterrupt:
+        sys.exit("\n已取消")

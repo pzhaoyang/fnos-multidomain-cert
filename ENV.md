@@ -11,7 +11,7 @@
 | `FNOS_PASS` | 网页登录密码 | 密码登录方式 | `你的密码` | — |
 | `FNOS_WS_PORT` | 本机 HTTPS 访问端口 | 端口不是 `5667` 时 | `5667` | `5667` |
 | `FNOS_ACCESS_CODE` | 「访问码 / 访问保护」的访问码 | NAS 开了访问码时 | `123456` | 空（不启用） |
-| `FNOS_2FA_CODE` | 验证器 App 当前 6 位码 | 账号开了双重验证时 | `123456` | 空（不启用） |
+| `FNOS_2FA_CODE` | 验证器 App 当前 6 位码 | 账号开了双重验证时（**可省略**，交互运行会提示输入） | `123456` | 空（改为提示输入） |
 | `FNOS_SECRET` | 浏览器里的 `fnos-Secret`（HMAC 密钥） | Cookie 方式 | `base64 字符串` | 空 |
 | `FNOS_COOKIE` | 浏览器 Cookie 请求头整行 | Cookie 方式 | `trim_session=...; other=...` | 空 |
 
@@ -46,9 +46,20 @@ python3 03-apply-multidomain-cert.py --test
 export FNOS_USER='admin'
 export FNOS_PASS='你的密码'
 export FNOS_ACCESS_CODE='123456'
-# 验证码 30 秒过期，必须在同一次执行里给
-export FNOS_2FA_CODE='123456'
 python3 03-apply-multidomain-cert.py --test
+```
+
+运行到需要时会提示输入，输错可重试（最多 3 次）：
+
+```text
+      该账号开启了双重验证（2FA）
+      请输入验证器 App 当前的 6 位验证码: _
+```
+
+需要免交互（比如被别的脚本调用）时，再把码塞进变量：
+
+```bash
+FNOS_2FA_CODE='123456' python3 03-apply-multidomain-cert.py --test
 ```
 
 ### 4) 端口不是 5667（改过访问端口 / 要走域名或反代）
@@ -88,8 +99,9 @@ python3 03-apply-multidomain-cert.py --test
 4. 访问码（可选）
    FNOS_ACCESS_CODE 非空 → 先 GET /access_code_verify 换会话 Cookie，再握手
 5. 密码模式登录后，若服务端声明需要 2FA
-   FNOS_2FA_CODE 非空 → 提交验证码（user.2fa.loginVerify）换 secret
-   为空               → 报错退出，提示怎么设
+   FNOS_2FA_CODE 非空   → 直接提交（user.2fa.loginVerify）换 secret
+   为空且 stdin 是终端 → 提示输入，输错/过期可重试 3 次
+   为空且非终端        → 报错退出，提示改用 FNOS_2FA_CODE
 6. 业务请求统一用 secret 签 HMAC 帧
 ```
 
@@ -99,7 +111,7 @@ python3 03-apply-multidomain-cert.py --test
 |---|---|
 | 连接地址 | `-s` > `FNOS_WS_PORT` > 默认 `5667` |
 | 认证方式 | 密码（`FNOS_USER`+`FNOS_PASS`）> `FNOS_SECRET` |
-| 2FA | 只有服务端要求时才用 `FNOS_2FA_CODE`；不需要时设了也会被忽略 |
+| 2FA | 只有服务端要求时才用：`FNOS_2FA_CODE` 优先，没设就交互提示；不需要时设了也会被忽略 |
 | 访问码 | 只要 `FNOS_ACCESS_CODE` 非空就先走校验；没开访问码时该值为空 |
 
 ## 四、怎么设置这些变量
@@ -144,6 +156,7 @@ read -rsp '密码: ' FNOS_PASS; echo; export FNOS_PASS
 |---|---|
 | 设了 `FNOS_WS_PORT` 却仍连旧端口 | 同时给了 `-s`，`-s` 优先 |
 | 设了 `FNOS_2FA_CODE` 仍提示需要验证码 | 变量与脚本不在同一次执行；或码已超过 30 秒 |
+| 非交互环境报「需要 2FA 验证码，但当前不是交互终端」 | 定时任务/管道里没法提示输入，改用 `FNOS_2FA_CODE` |
 | 同时设了密码和 `FNOS_SECRET`，行为跟预期不符 | 密码模式优先，`FNOS_SECRET` 被忽略 |
 | 端口改了不生效 | 变量名拼错（必须 `FNOS_WS_PORT`）；或被 `-s` 覆盖 |
 | 访问码明明正确还是 `401` | 该端口指向的是别的服务/反代，换端口或改用 `-s` |

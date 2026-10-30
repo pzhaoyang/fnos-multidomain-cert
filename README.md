@@ -45,8 +45,7 @@ export FNOS_PASS='你的网页登录密码'
 # —— 按需：NAS 开了「访问码 / 访问保护」——
 export FNOS_ACCESS_CODE='你的访问码'
 
-# —— 按需：账号开了「双重验证（2FA）」，填验证器当前的 6 位码 ——
-export FNOS_2FA_CODE='123456'
+# 2FA 验证码不用设：脚本会直接提示你输入（见下文）
 ```
 
 ### 3. 只读自检
@@ -61,8 +60,15 @@ python3 03-apply-multidomain-cert.py --test
 
 ```bash
 python3 03-apply-multidomain-cert.py \
-  -d "example.com,*.example.com,www.example.com" \
-  -r 1
+  -d "example.com,*.example.com,www.example.com"
+```
+
+`-r` 可以省略：脚本会读 NAS 上的 DDNS 记录，按域名后缀自动挑最匹配的那条。
+要自己指定就先查 id：
+
+```bash
+python3 03-apply-multidomain-cert.py --list-ddns    # 只读，列出 id / 服务商 / 域名
+python3 03-apply-multidomain-cert.py -d "..." -r 3
 ```
 
 参数：
@@ -70,10 +76,11 @@ python3 03-apply-multidomain-cert.py \
 | 参数 | 含义 | 默认 |
 |---|---|---|
 | `-d` / `--domains` | 逗号分隔域名列表（可含通配符 `*.x`） | 必填 |
-| `-r` / `--related-ddns-id` | DDNS 记录 id（提供 DNS-01 解析商凭证） | 1 |
+| `-r` / `--related-ddns-id` | DDNS 记录 id（提供 DNS-01 解析商凭证） | **留空自动匹配**，先校验存在 |
 | `-s` / `--server` | WS 地址，留空自动探测 | 本机 HTTPS 端口（`FNOS_WS_PORT` 可指定，默认 5667） |
 | `--desc` | 证书备注 | multidomain-cert |
 | `--test` | 只登录 + 列证书，不做写操作 | — |
+| `--list-ddns` | 只列 DDNS 记录后退出 | — |
 
 依赖：`python3`（标准库）+ `openssl`（fnOS 自带）。
 
@@ -127,7 +134,18 @@ export FNOS_ACCESS_CODE='你的访问码'
 ### 双重验证 2FA（应用层）
 
 开了 2FA 后，`user.login` 只返回 `accessToken`，**不返回签帧用的 `secret`**，
-所以必须先补一步验证码：
+所以必须先补一步验证码。**直接跑脚本即可，它会在需要时提示你输入**：
+
+```text
+[0] WS 已连接: wss://127.0.0.1:5667/websocket?type=main
+      密码自动登录中...
+      该账号开启了双重验证（2FA）
+      请输入验证器 App 当前的 6 位验证码: _
+      登录成功 uid=1000
+```
+
+输错或超时不会中断，会提示重新输入（最多 3 次）。也可以预先把码塞进环境变量，
+适合脚本编排：
 
 ```bash
 export FNOS_2FA_CODE='123456'    # 取完立刻跑，别等
@@ -139,6 +157,7 @@ python3 03-apply-multidomain-cert.py --test
 
 > 验证码 30 秒过期，**不适合放进定时任务**。但证书签发后由 fnOS 自己按 `renewal:1`
 > 自动续签，本脚本只在「要新签一张」时才跑一次，所以一次 2FA 不影响长期无人值守。
+> 若在非交互环境（无终端）运行，脚本会明确要求改用 `FNOS_2FA_CODE`。
 
 ## 报错 → 原因 → 解决
 
@@ -147,11 +166,12 @@ python3 03-apply-multidomain-cert.py --test
 | `Connection refused` / 超时 | 端口不对或服务未开 | 设 `FNOS_WS_PORT` 或用 `-s` 给完整地址 |
 | `WS 握手失败: HTTP/1.1 401`，带 `X-Trim-Safe-Code-Challenge` | 访问码拦截 | 设 `FNOS_ACCESS_CODE`，或关闭访问码 |
 | `WS 握手失败: HTTP/1.1 401`，无该响应头 | 端口/反代指向了别的服务 | 核对端口与反代规则 |
-| `该账号开启了双重验证（2FA）` / `135168` | 缺验证码或码已过期 | 设 `FNOS_2FA_CODE`，取码后立刻运行 |
+| `该账号开启了双重验证（2FA）` / `135168` | 缺验证码或码已过期 | 交互运行让脚本提示输入，或设 `FNOS_2FA_CODE` |
 | `登录失败：用户名或密码错误（131072）` | 用户名或密码不对 | 核对 `FNOS_USER` / `FNOS_PASS` |
 | `errno 65534`（验签失败） | 已连上但会话未绑定 | 改用 Cookie 方式，且 `FNOS_COOKIE` 要取**完整**整行 |
 | `errno 8192` / `3000001` | 参数格式不对 | 确认 `deviceType` 为字符串 `Browser`；2FA 字段不要缺 |
-| `3000033 Cert Apply Domain Not Match` | 域名与 DDNS 记录不匹配 | 换 `-r` 指向正确的 DDNS 记录 |
+| `3000034 Cert Apply DDNS Record Not Found` | `-r` 指向的 DDNS 记录不存在 | 省略 `-r` 让脚本自动匹配，或 `--list-ddns` 查真实 id |
+| `3000033 Cert Apply Domain Not Match` | 域名与 DDNS 记录不同区 | 换 `-r`，或省略让脚本自动匹配 |
 | `3000035 Cert Not Renewable` | 条目丢了续签资格 | 脚本已在 `cert.replace` 带 `renewal:1`，无需手动处理 |
 | `Certificate bundle starts with a CA certificate` | 种子证书是 CA:TRUE | 脚本已用 `CA:FALSE` 生成，无需手动处理 |
 
