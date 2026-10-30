@@ -77,17 +77,18 @@ python3 03-apply-multidomain-cert.py \
 
 依赖：`python3`（标准库）+ `openssl`（fnOS 自带）。
 
-## 环境变量总表
+## 环境变量
 
-| 变量 | 何时需要 | 说明 |
+脚本只从环境变量读配置。完整说明（优先级、生效逻辑、四种组合、误用排查）见
+**[ENV.md](ENV.md)**，速查表：
+
+| 变量 | 作用 | 何时需要 |
 |---|---|---|
-| `FNOS_USER` | 密码登录 | 网页登录用户名 |
-| `FNOS_PASS` | 密码登录 | 网页登录密码；末尾 `\r\n` 脚本会自动去掉 |
-| `FNOS_WS_PORT` | 端口非 5667 时 | 本机 HTTPS 端口，默认 `5667` |
-| `FNOS_ACCESS_CODE` | 开了访问码时 | 访问码；脚本先换会话 Cookie 再握手 |
-| `FNOS_2FA_CODE` | 开了 2FA 时 | 验证器当前 6 位码，**30 秒内有效，必须与脚本同一次执行** |
-| `FNOS_SECRET` | Cookie 方式 | 浏览器里的 `fnos-Secret` |
-| `FNOS_COOKIE` | Cookie 方式 | 完整 Cookie 请求头整行 |
+| `FNOS_USER` / `FNOS_PASS` | 网页登录用户名 / 密码 | 密码登录方式（推荐） |
+| `FNOS_WS_PORT` | 本机 HTTPS 端口，默认 `5667` | 端口改过时 |
+| `FNOS_ACCESS_CODE` | 访问码 | NAS 开了「访问码 / 访问保护」时 |
+| `FNOS_2FA_CODE` | 验证器当前 6 位码 | 账号开了「双重验证」时 |
+| `FNOS_SECRET` / `FNOS_COOKIE` | 浏览器里的 Secret 与 Cookie | 改用 Cookie 方式时 |
 
 `FNOS_USER`+`FNOS_PASS` 与 `FNOS_SECRET` 二选一；有了密码登录就不用取 Cookie。
 
@@ -175,6 +176,7 @@ python3 03-apply-multidomain-cert.py --test
 | 文件 | 用途 |
 |---|---|
 | `03-apply-multidomain-cert.py` | **你现在唯一需要跑的脚本**（密码登录 + 一键申请） |
+| `ENV.md` | 环境变量完整参考：总表、四种组合、生效逻辑、误用排查 |
 | `NOTES.md` | 完整背景、原理、协议细节、踩坑记录 |
 | `archive/` | **旧方案存档**（已弃用）：浏览器 Cookie 方案 + Windows 种子证书生成器，见 `archive/README.md` |
 
