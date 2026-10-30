@@ -335,6 +335,30 @@ frame = base64( HMAC-SHA256( json, secret_bytes ) ) + json
 - 排查顺序速记：`3000034` = 记录 id 不存在 → `3000033` = 域名与记录 domain 不匹配
   → `3000035` = 记录存在但条目没续签资格（replace 没带 renewal:1）
 
+### 坑 18：「记住登录」不能靠缓存会话，要靠受信设备
+- 直觉：登录一次拿到 `secret`/`token`，存下来下次直接用
+- 实测（全部 `errno 65534`，逐条试过）：
+  | 尝试 | 结果 |
+  |---|---|
+  | 只带 `secret`，新连接发 `authToken{main:true, si}` | 65534 |
+  | `authToken{token, main:true}`（浏览器里存的 token） | 65534 |
+  | 明文 / 加密 `user.auth{token}` | 65534 |
+  | `user.tokenLogin{token, deviceType, deviceName, did}` | 65534 |
+  | `tokenLogin` 传 longToken | 65534 |
+- 结论：**会话是连接级的**。网页之所以能“记住”，是因为它的 WS 握手**带着浏览器 Cookie**，
+  而 `authToken` 缺了那个 Cookie 的会话上下文就一律验签失败
+- 更绝的是：服务端**根本不下发会话 Cookie** ——
+  `GET /`、`/login`、`/v1/`、`/websocket`（无 Upgrade）全部 0 个 `Set-Cookie`。
+  所以从纯 WS 客户端这边，**没有任何 Cookie 可以复现**
+- 可行方案：官方本来就有「信任此设备」
+  - `user.2fa.loginVerify` 里带 `isTrustedDevice: true`（等价网页勾选“信任此设备”）
+  - 再尽力调 `appcgi.tfa.security.v1.device.trust` 登记（参数形态未公开，多形态尝试）
+  - 关键是 **`did` 必须跨次稳定**，否则每次都是新设备，信任不生效
+- 于是落地成：`~/.fnos-cert.conf`（600）保存 `user/pass/access_code/did/port/server`，
+  第一次输入、之后零输入；`--forget` 清除、`--no-save` 不写
+- 教训：**别硬啃“缓存凭据”**。先找产品自己提供的“记住我”语义（这里是受信设备），
+  比伪造会话可靠得多
+
 ---
 
 ## 五、DDNS 记录与 relatedDDNSId（实测，重要）

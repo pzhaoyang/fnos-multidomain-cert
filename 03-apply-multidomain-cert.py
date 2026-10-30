@@ -477,13 +477,16 @@ class FnosCert:
             raw = raw[:-padlen]
         return raw
 
-    def login(self, username, password):
+    def login(self, username, password, did=""):
         """密码登录。
 
         若账号开了双重验证（2FA），服务端只返回 accessToken、不返回 secret，
         此时抛 TwofaRequired，由调用方用验证码补一步 twofa_verify()。
+
+        did 是设备身份：**必须跨次稳定**，fnOS 的「信任此设备」就是按它认的；
+        首次生成后由调用方持久化，下次传回来就能跳过 2FA。
         """
-        self.did = "x" + "".join(random.choice("0123456789abcdef") for _ in range(20))
+        self.did = did or ("x" + "".join(random.choice("0123456789abcdef") for _ in range(20)))
         payload = {
             "user": username, "password": password,
             "deviceName": self.device_name, "deviceType": "Browser",
@@ -639,6 +642,36 @@ def gen_seed_cert(domains):
 
 
 # ---------------- 主流程 ----------------
+# ---------------- 本地配置（记住登录信息）----------------
+CONF_PATH = os.path.expanduser("~/.fnos-cert.conf")
+
+
+def load_conf():
+    """读取本地配置；不存在/损坏都当成空配置"""
+    try:
+        with open(CONF_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_conf(conf):
+    """写入本地配置（权限 600，等同登录凭据，别共享）"""
+    try:
+        fd = os.open(CONF_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(conf, f, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(CONF_PATH, 0o600)
+        except OSError:
+            pass
+        return True
+    except OSError as e:
+        print(f"      ! 保存登录信息失败: {e}")
+        return False
+
+
 # ---------------- 2FA 交互 ----------------
 def _ask(prompt, secret=False):
     """读一行输入；EOF / Ctrl-C 时返回 None（表示放弃交互）"""
@@ -649,11 +682,29 @@ def _ask(prompt, secret=False):
         return None
 
 
+def trust_this_device(api):
+    """把当前设备加入受信列表（对应网页里的「信任此设备」）。
+
+    参数形态没在前端主包里，逐步尝试；失败不算错误——下次最多还是问验证码。
+    """
+    for payload in ({"did": api.did, "deviceName": api.device_name},
+                    {"did": api.did},
+                    {"device": api.did}):
+        try:
+            r = api.call("appcgi.tfa.security.v1.device.trust", payload)
+        except RuntimeError:
+            continue
+        if r.get("result") == "succ":
+            return True
+    return False
+
+
 def ask_twofa(api, initial=""):
     """获取并提交 2FA 验证码。
 
     优先用 FNOS_2FA_CODE；没有则交互提示（终端里直接运行即可）。
     验证码输错/过期允许重输，最多 3 次——因为 30 秒窗口很容易卡在“手慢”上。
+    首次通过后会把当前设备设为「受信设备」，同一 did 下次可跳过验证码。
     """
     code = (initial or "").strip()
     for attempt in range(1, 4):
@@ -663,14 +714,19 @@ def ask_twofa(api, initial=""):
                     "需要 2FA 验证码，但当前不是交互终端（stdin 不是终端）。\n"
                     "  请在终端里直接运行本脚本，或 export FNOS_2FA_CODE='6 位码' 后重跑。"
                 )
-            ans = _ask("      请输入验证器 App 当前的 6 位验证码: ")
+            ans = _ask("      请输入验证器 App 当前的 6 位验证码（记住后会免输）: ")
             if ans is None:
                 sys.exit("已取消（非交互环境请用 FNOS_2FA_CODE）")
             code = ans.strip()
             if not code:
                 continue
         try:
-            api.twofa_verify(code)
+            # isTrustedDevice=True = 勾选「信任此设备」
+            api.twofa_verify(code, trusted=True)
+            if trust_this_device(api):
+                print("      已把本设备加入受信列表，下次运行免验证码")
+            else:
+                print("      提示：设备受信登记未成功，下次可能仍要输入验证码")
             return True
         except RuntimeError as e:
             msg = str(e)
@@ -759,14 +815,29 @@ def main():
     ap.add_argument("--test", action="store_true", help="只测连通性（列证书，不写任何东西）")
     ap.add_argument("--list-ddns", action="store_true",
                     help="只列出 DDNS 记录 id 与域名（然后退出）")
+    ap.add_argument("--no-save", action="store_true", help="本次不把登录信息写入本地配置")
+    ap.add_argument("--forget", action="store_true",
+                    help="删除已保存的登录信息（本地配置）后退出")
     args = ap.parse_args()
 
-    username = os.environ.get("FNOS_USER", "").rstrip("\r\n")
-    password = os.environ.get("FNOS_PASS", "").rstrip("\r\n")
+    # ---- 本地配置：记住用户名/密码/访问码/设备 id/端口 ----
+    if args.forget:
+        if os.path.exists(CONF_PATH):
+            os.remove(CONF_PATH)
+            print(f"已删除 {CONF_PATH}（下次运行会重新询问登录信息）")
+        else:
+            print(f"没有保存过登录信息（{CONF_PATH} 不存在）")
+        return
+    conf = load_conf()
+
+    username = os.environ.get("FNOS_USER", "").rstrip("\r\n") or conf.get("user", "")
+    password = os.environ.get("FNOS_PASS", "").rstrip("\r\n") or conf.get("pass", "")
     secret = os.environ.get("FNOS_SECRET", "").rstrip("\r\n")
     cookie = os.environ.get("FNOS_COOKIE", "").rstrip("\r\n")
-    access_code = os.environ.get("FNOS_ACCESS_CODE", "").rstrip("\r\n")
+    access_code = (os.environ.get("FNOS_ACCESS_CODE", "").rstrip("\r\n")
+                   or conf.get("access_code", ""))
     twofa_code = os.environ.get("FNOS_2FA_CODE", "").rstrip("\r\n")
+    did = conf.get("did", "")          # 设备 id：受信设备就是靠它认的，必须稳定
     tty = sys.stdin.isatty()
 
     only_query = args.test or args.list_ddns
@@ -774,7 +845,7 @@ def main():
         sys.exit("错误：-d 必填（逗号分隔域名列表），或用 --test / --list-ddns 只看不改")
     domains = [x.strip() for x in (args.domains or "").split(",") if x.strip()]
 
-    # ---- 凭据：环境变量优先，缺哪项就交互补哪项（和 2FA 一样的手感）----
+    # ---- 凭据：环境变量 > 本地配置 > 交互输入 ----
     if not secret:
         if not username:
             if not tty:
@@ -796,14 +867,23 @@ def main():
 
     use_password = bool(username and password)
 
-    # ---- 端点：-s > FNOS_WS_PORT > 自动探测本机端口 > 交互询问 ----
+    # ---- 端点：-s > FNOS_WS_PORT > 已保存的地址/端口 > 自动探测 > 交互询问 ----
+    port_used = None
     if args.server:
         candidates = [args.server]
     else:
         port_env = os.environ.get("FNOS_WS_PORT", "").rstrip("\r\n")
         if port_env:
+            port_used = int(port_env) if port_env.isdigit() else None
             candidates = [f"wss://127.0.0.1:{port_env}/websocket?type=main"]
             print(f"[0] 使用 FNOS_WS_PORT={port_env}")
+        elif conf.get("server"):
+            candidates = [conf["server"]]
+            print(f"[0] 使用已保存的地址 {conf['server']}")
+        elif conf.get("port"):
+            port_used = int(conf["port"])
+            candidates = [f"wss://127.0.0.1:{port_used}/websocket?type=main"]
+            print(f"[0] 使用已保存的端口 {port_used}")
         else:
             print("[0] 探测本机 fnOS 网页端口...")
             port, why = detect_ws_port()
@@ -818,6 +898,7 @@ def main():
                 port = 5667
                 print("      ✗ 未能自动识别，回退到默认端口 5667")
             candidates = [f"wss://127.0.0.1:{port}/websocket?type=main"]
+            port_used = port
 
     api = last_err = None
     for u in candidates:
@@ -863,7 +944,7 @@ def main():
             if use_password:
                 print("      密码自动登录中...")
                 try:
-                    api.login(username, password)
+                    api.login(username, password, did)
                 except TwofaRequired as e:
                     api.access_token = e.access_token
                     print("      该账号开启了双重验证（2FA）")
@@ -877,6 +958,22 @@ def main():
 
     if not use_password:
         api.handshake()
+
+    # ---- 记住这次成功用到的登录信息（下次免输入）----
+    if not args.no_save:
+        new_conf = dict(conf)
+        if use_password:
+            new_conf.update({"user": username, "pass": password})
+        if access_code:
+            new_conf["access_code"] = access_code
+        if api.did:
+            new_conf["did"] = api.did
+        if port_used:
+            new_conf["port"] = port_used
+        if args.server:
+            new_conf["server"] = args.server
+        if new_conf != conf and save_conf(new_conf):
+            print(f"      登录信息已保存到 {CONF_PATH}（下次免输入；--forget 清除）")
 
     if args.list_ddns:
         print_ddns(list_ddns(api))
