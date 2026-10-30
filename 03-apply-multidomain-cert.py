@@ -10,32 +10,26 @@
 
 依赖：python3（标准库）+ openssl（加密登录 + 生成种子证书）
 
-用法（两种认证方式任选其一）：
-    # 方式 A（推荐）：密码自动登录，完全自动化
+用法（零配置：缺什么就提示你输入什么）：
+    python3 03-apply-multidomain-cert.py --test
+    python3 03-apply-multidomain-cert.py -d "example.com,*.example.com"
+
+    脚本会：
+      - 自动探测本机 fnOS 的 HTTPS 端口（nginx 配置 + 实监听端口实测）
+      - 没设用户名/密码就提示输入（密码不回显）
+      - 遇到「访问码」就提示输入
+      - 遇到「双重验证」就提示输入 6 位码
+
+也可以用环境变量免交互（CI / 定时 / 远程执行）：
     export FNOS_USER='你的用户名'
     export FNOS_PASS='你的密码'
-    export FNOS_WS_PORT='5667'          # 按需：改过 HTTPS 端口才需要
-    python3 03-apply-multidomain-cert.py --test
-    python3 03-apply-multidomain-cert.py -d "example.com,*.example.com" -r 1
+    export FNOS_WS_PORT='5667'          # 按需：自动探测不到时
+    export FNOS_ACCESS_CODE='你的访问码'  # 按需：NAS 开了访问码
+    export FNOS_2FA_CODE='123456'        # 按需：账号开了 2FA，30 秒内有效
 
-    # 方式 B（备选）：手动从浏览器取 secret + cookie
+备选认证（需要用浏览器取一次）：
     export FNOS_SECRET='<fnos-Secret>'
     export FNOS_COOKIE='<Cookie 请求头整行>'
-    python3 03-apply-multidomain-cert.py --test
-
-按需追加的环境变量：
-    export FNOS_ACCESS_CODE='你的访问码'   # NAS 开了「访问码/访问保护」时
-    export FNOS_2FA_CODE='123456'         # 账号开了「双重验证」时，30 秒内有效
-
-如果 NAS 开启了「访问码（访问保护）」，握手会在 nginx 层被 401 拦下
-（响应头 X-Trim-Safe-Code-Challenge: 1）。此时再补一个环境变量即可：
-    export FNOS_ACCESS_CODE='你的访问码'
-脚本会先调用 /access_code_verify 换取会话 Cookie，再建立 WS 连接。
-
-如果账号开启了「双重验证（2FA）」，登录只返回 accessToken、不返回 secret，
-此时需再补：
-    export FNOS_2FA_CODE='验证器里的 6 位码'
-脚本会自动补一步 user.2fa.loginVerify 换取 secret，然后照常签发。
 
 协议要点（全部实测得出）：
     - 密码登录：getRSAPub → RSA-OAEP-SHA256 加密随机 AES-256 密钥 →
@@ -55,7 +49,9 @@ import hashlib
 import hmac
 import json
 import os
+import getpass
 import random
+import re
 import shutil
 import socket
 import ssl
@@ -71,19 +67,164 @@ try:
 except Exception:
     pass
 
-def _default_candidates():
-    """默认候选端点：本机 loopback 的 HTTPS 端口。
-    fnOS 系统默认 HTTPS 访问端口是 5667；若你改过端口，用环境变量 FNOS_WS_PORT 覆盖。"""
-    port = os.environ.get("FNOS_WS_PORT", "").rstrip("\r\n") or "5667"
-    return [
-        f"wss://127.0.0.1:{port}/websocket?type=main",
-    ]
+
+# ---------------- 本机 fnOS 网页端口探测 ----------------
+def _port_hints_from_nginx(roots=None):
+    """从 nginx 配置里找 listen 端口（带回是否 ssl 的标记）。
+
+    fnOS 的网页入口由 nginx 提供，改过端口的话配置里会有对应 listen 指令。
+    找不到配置也没关系，后面还有「监听端口实测」兜底。
+    """
+    hints = []
+    if roots is None:
+        roots = [
+            "/etc/nginx",
+            "/usr/trim/nginx",
+            "/usr/trim/etc/nginx",
+            "/usr/local/nginx/conf",
+            "/usr/trim/var/nginx",
+        ]
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = dirpath[len(root):].count(os.sep)
+            if depth >= 3:
+                dirnames[:] = []
+            for fn in filenames:
+                if not fn.endswith((".conf", ".conf.template", ".tmpl")):
+                    continue
+                path = os.path.join(dirpath, fn)
+                try:
+                    if os.path.getsize(path) > 512 * 1024:
+                        continue
+                    with open(path, "r", errors="ignore") as f:
+                        txt = f.read()
+                except OSError:
+                    continue
+                for m in re.finditer(r"^\s*listen\s+(?:[0-9.\[\]:]*:)?(\d{2,5})\b([^\n]*)",
+                                     txt, re.M):
+                    port = int(m.group(1))
+                    if 1 <= port <= 65535:
+                        hints.append((port, "ssl" in m.group(2).lower(), path))
+    return hints
 
 
-DEFAULT_CANDIDATES = _default_candidates()
+def _listening_ports():
+    """从 /proc/net/tcp{,6} 读正在 LISTEN 的本地端口（无外部依赖）"""
+    ports = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(name, "r") as f:
+                lines = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for ln in lines:
+            parts = ln.split()
+            if len(parts) < 4 or parts[3] != "0A":     # 0A = LISTEN
+                continue
+            try:
+                ports.add(int(parts[1].split(":")[1], 16))
+            except (IndexError, ValueError):
+                continue
+    return ports
+
+
+def _probe_fn(os_port, timeout=2.5):
+    """实测 127.0.0.1:port 是不是 fnOS 的网页/WS 入口。
+
+    判据（任一即可）：
+      - 握手返回 101（无访问码时的正常情况）
+      - 响应头带 X-Trim-Safe-Code-Challenge（开了访问码，实际是 401）
+      - nginx 返回 401/302（登录页/重定向），说明这个 TLS 端口就是网页入口
+    """
+    sock = None
+    try:
+        raw = socket.create_connection(("127.0.0.1", os_port), timeout=timeout)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            sock = ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+        except (ssl.SSLError, OSError):
+            return False                     # 不是 TLS 端口，直接排除
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.settimeout(timeout)
+        sock.sendall((
+            f"GET /websocket?type=main HTTP/1.1\r\nHost: 127.0.0.1:{os_port}\r\n"
+            f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ).encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+            if len(resp) > 16384:
+                break
+        head = resp.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace")
+        first = head.split("\r\n", 1)[0]
+        low = head.lower()
+        if " 101" in first and "websocket" in low:
+            return True
+        if "x-trim-safe-code-challenge" in low:
+            return True
+        if "server: nginx" in low and (" 401" in first or " 302" in first):
+            return True
+        return False
+    except OSError:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def detect_ws_port():
+    """探测本机 fnOS 网页端口，返回 (port, 说明) 或 (None, "")。
+
+    顺序：默认 5667 → nginx 配置里带 ssl 的 listen → 其余配置端口 → 实际监听端口。
+    """
+    hints = _port_hints_from_nginx()
+    listening = _listening_ports()
+
+    order = []
+    seen = set()
+
+    def push(port, why):
+        if port in seen or not (1 <= port <= 65535):
+            return
+        seen.add(port)
+        order.append((port, why))
+
+    push(5667, "fnOS 默认 HTTPS 端口")
+    for port, is_ssl, path in hints:
+        if is_ssl:
+            push(port, f"nginx 配置 {path}")
+    for port, is_ssl, path in hints:
+        if not is_ssl:
+            push(port, f"nginx 配置 {path}")
+    for port in sorted(listening):
+        push(port, "本机监听端口")
+
+    for port, why in order[:40]:
+        if _probe_fn(port):
+            return port, why
+    return None, ""
 
 
 # ---------------- 访问码（访问保护）----------------
+class AccessCodeRequired(RuntimeError):
+    """NAS 开了访问码/访问保护，需要访问码才能握手"""
+
+    def __init__(self, detail=""):
+        self.detail = detail
+        super().__init__("该 NAS 开启了「访问码 / 访问保护」")
+
+
 def _verify_access_code(host, port, scheme, code, timeout=15):
     """fnOS「访问码」开启时，握手前必须先换取会话 Cookie。
 
@@ -182,13 +323,12 @@ class WS:
             first = resp.split(b"\r\n", 1)[0].decode(errors="replace")
             head = resp[:2048].decode(errors="replace")
             if "X-Trim-Safe-Code-Challenge" in head:
+                if not access_code:
+                    # 交给上层：交互运行就提示输入，非交互就报错
+                    raise AccessCodeRequired(first)
                 raise RuntimeError(
                     "WS 握手失败: " + first +
-                    "\n  该 fnOS 开启了「访问码 / 访问保护」，请求在 nginx 层就被拦截了"
-                    "（响应头 X-Trim-Safe-Code-Challenge: 1），脚本的密码登录还没机会执行。"
-                    "\n  解决（任选其一）："
-                    "\n    a) export FNOS_ACCESS_CODE='你的访问码'  —— 脚本会先换会话 Cookie 再握手"
-                    "\n    b) fnOS 网页 → 安全性 → 访问设置 → 关闭访问码，然后重试"
+                    "\n  访问码已提供但握手仍被拦，通常是访问码不对或会话 Cookie 未被接受。"
                 )
             raise RuntimeError("WS 握手失败: " + first)
         self.buf = resp.split(b"\r\n\r\n", 1)[1]
@@ -498,6 +638,15 @@ def gen_seed_cert(domains):
 
 # ---------------- 主流程 ----------------
 # ---------------- 2FA 交互 ----------------
+def _ask(prompt, secret=False):
+    """读一行输入；EOF / Ctrl-C 时返回 None（表示放弃交互）"""
+    try:
+        return getpass.getpass(prompt) if secret else input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
 def ask_twofa(api, initial=""):
     """获取并提交 2FA 验证码。
 
@@ -512,10 +661,10 @@ def ask_twofa(api, initial=""):
                     "需要 2FA 验证码，但当前不是交互终端（stdin 不是终端）。\n"
                     "  请在终端里直接运行本脚本，或 export FNOS_2FA_CODE='6 位码' 后重跑。"
                 )
-            try:
-                code = input("      请输入验证器 App 当前的 6 位验证码: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                sys.exit("\n已取消")
+            ans = _ask("      请输入验证器 App 当前的 6 位验证码: ")
+            if ans is None:
+                sys.exit("已取消（非交互环境请用 FNOS_2FA_CODE）")
+            code = ans.strip()
             if not code:
                 continue
         try:
@@ -614,22 +763,98 @@ def main():
     cookie = os.environ.get("FNOS_COOKIE", "").rstrip("\r\n")
     access_code = os.environ.get("FNOS_ACCESS_CODE", "").rstrip("\r\n")
     twofa_code = os.environ.get("FNOS_2FA_CODE", "").rstrip("\r\n")
-
-    use_password = bool(username and password)
-    if not use_password and not secret:
-        sys.exit("错误：请设置 FNOS_USER+FNOS_PASS（自动登录），或 FNOS_SECRET（手动从浏览器取）")
+    tty = sys.stdin.isatty()
 
     only_query = args.test or args.list_ddns
     if not only_query and not args.domains:
         sys.exit("错误：-d 必填（逗号分隔域名列表），或用 --test / --list-ddns 只看不改")
     domains = [x.strip() for x in (args.domains or "").split(",") if x.strip()]
 
-    # 连接（自动探测端点——可用 FNOS_WS_PORT 指定端口，默认 fnOS 系统 HTTPS 端口）
-    candidates = [args.server] if args.server else DEFAULT_CANDIDATES
+    # ---- 凭据：环境变量优先，缺哪项就交互补哪项（和 2FA 一样的手感）----
+    if not secret:
+        if not username:
+            if not tty:
+                sys.exit("错误：未设置 FNOS_USER（或改用 FNOS_SECRET），且当前不是交互终端")
+            print("[0] 未检测到用户名，请输入（也可 export FNOS_USER 免输入）")
+            ans = _ask("      用户名: ")
+            if ans is None:
+                sys.exit("已取消（非交互环境请用 FNOS_USER / FNOS_PASS 环境变量）")
+            username = ans.strip()
+        if not password:
+            if not tty:
+                sys.exit("错误：未设置 FNOS_PASS，且当前不是交互终端")
+            ans = _ask("      密码（输入时不显示）: ", secret=True)
+            if ans is None:
+                sys.exit("已取消（非交互环境请用 FNOS_USER / FNOS_PASS 环境变量）")
+            password = ans
+        if not username or not password:
+            sys.exit("错误：用户名或密码为空")
+
+    use_password = bool(username and password)
+
+    # ---- 端点：-s > FNOS_WS_PORT > 自动探测本机端口 > 交互询问 ----
+    if args.server:
+        candidates = [args.server]
+    else:
+        port_env = os.environ.get("FNOS_WS_PORT", "").rstrip("\r\n")
+        if port_env:
+            candidates = [f"wss://127.0.0.1:{port_env}/websocket?type=main"]
+            print(f"[0] 使用 FNOS_WS_PORT={port_env}")
+        else:
+            print("[0] 探测本机 fnOS 网页端口...")
+            port, why = detect_ws_port()
+            if port:
+                print(f"      检测到端口 {port}（{why}）")
+            elif tty:
+                print("      ✗ 未能自动识别")
+                ans = _ask("      请输入 fnOS 的 HTTPS 访问端口（回车用默认 5667）: ")
+                ans = (ans or "").strip()
+                port = int(ans) if ans.isdigit() else 5667
+            else:
+                port = 5667
+                print("      ✗ 未能自动识别，回退到默认端口 5667")
+            candidates = [f"wss://127.0.0.1:{port}/websocket?type=main"]
+
     api = last_err = None
     for u in candidates:
-        try:
-            api = FnosCert(u, secret if not use_password else "", cookie, access_code)
+        code = access_code
+        for attempt in range(1, 4):
+            try:
+                api = FnosCert(u, secret if not use_password else "", cookie, code)
+                last_err = None
+                break
+            except AccessCodeRequired:
+                api = None
+                if not tty:
+                    sys.exit("该 NAS 开启了「访问码 / 访问保护」："
+                             "请 export FNOS_ACCESS_CODE='访问码' 后重跑")
+                if attempt == 1:
+                    print("      该 NAS 开启了「访问码 / 访问保护」")
+                ans = _ask("      请输入访问码（也可 export FNOS_ACCESS_CODE）: ")
+                if ans is None or not ans.strip():
+                    sys.exit("已取消")
+                code = ans.strip()
+            except RuntimeError as e:
+                api = None
+                if "访问码校验失败" in str(e) and tty:
+                    print(f"      ✗ {e}")
+                    ans = _ask("      请重新输入访问码: ")
+                    if ans is None or not ans.strip():
+                        sys.exit("已取消")
+                    code = ans.strip()
+                    continue
+                print(f"      端点不可用或登录失败 {u}: {e}")
+                last_err = e
+                break
+            except OSError as e:
+                api = None
+                if isinstance(e, ConnectionRefusedError):
+                    print(f"      连接被拒绝：127.0.0.1 上没有服务在监听（端口不对，或 fnOS 服务未启动）")
+                else:
+                    print(f"      端点不可用 {u}: {e}")
+                last_err = e
+                break
+        if api:
             print("[0] WS 已连接:", u)
             if use_password:
                 print("      密码自动登录中...")
@@ -641,12 +866,10 @@ def main():
                     ask_twofa(api, twofa_code)
                 print(f"      登录成功 uid={api.login_uid} admin={api.login_admin}")
             break
-        except Exception as e:
-            print(f"      端点不可用或登录失败 {u}: {e}")
-            last_err = e
-            api = None
     if not api:
-        sys.exit(f"所有端点均不可用，最后一个错误: {last_err}")
+        sys.exit(f"无法连接到 fnOS：{last_err}\n"
+                 "  可尝试：export FNOS_WS_PORT='你的 HTTPS 端口'，"
+                 "或 -s 'wss://IP:端口/websocket?type=main'")
 
     if not use_password:
         api.handshake()
@@ -737,6 +960,8 @@ if __name__ == "__main__":
     try:
         main()
     except RuntimeError as e:
+        sys.exit(f"错误: {e}")
+    except OSError as e:
         sys.exit(f"错误: {e}")
     except KeyboardInterrupt:
         sys.exit("\n已取消")

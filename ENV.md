@@ -1,17 +1,18 @@
 # 环境变量完整参考
 
-> 脚本**只从环境变量读配置**，不读写任何配置文件，也不接受配置文件路径。
-> 所有变量的值末尾的 `\r\n` 会被自动去掉（Windows / 管道传值时常见）。
+> **全部可选**：一个都不设也能跑，脚本会依次探测端口、提示输入用户名 / 密码 / 访问码 / 验证码。
+> 设环境变量只是为了**免交互**（cron、管道、远程执行）。
+> 脚本只从环境变量读配置，不读写任何配置文件；值末尾的 `\r\n` 会被自动去掉。
 
 ## 一、总表
 
 | 变量 | 作用 | 何时必需 | 取值示例 | 默认 |
 |---|---|---|---|---|
-| `FNOS_USER` | 网页登录用户名 | 密码登录方式 | `admin` | — |
-| `FNOS_PASS` | 网页登录密码 | 密码登录方式 | `你的密码` | — |
-| `FNOS_WS_PORT` | 本机 HTTPS 访问端口 | 端口不是 `5667` 时 | `5667` | `5667` |
-| `FNOS_ACCESS_CODE` | 「访问码 / 访问保护」的访问码 | NAS 开了访问码时 | `123456` | 空（不启用） |
-| `FNOS_2FA_CODE` | 验证器 App 当前 6 位码 | 账号开了双重验证时（**可省略**，交互运行会提示输入） | `123456` | 空（改为提示输入） |
+| `FNOS_USER` | 网页登录用户名 | 想免去交互输入时 | `admin` | 空（改为提示输入） |
+| `FNOS_PASS` | 网页登录密码 | 想免去交互输入时 | `你的密码` | 空（改为提示输入） |
+| `FNOS_WS_PORT` | 本机 HTTPS 访问端口 | 自动探测不到时 | `8443` | 自动探测，兜底 `5667` |
+| `FNOS_ACCESS_CODE` | 「访问码 / 访问保护」的访问码 | 非交互 + 开了访问码 | `123456` | 空（改为提示输入） |
+| `FNOS_2FA_CODE` | 验证器 App 当前 6 位码 | 非交互 + 账号开了双重验证 | `123456` | 空（改为提示输入） |
 | `FNOS_SECRET` | 浏览器里的 `fnos-Secret`（HMAC 密钥） | Cookie 方式 | `base64 字符串` | 空 |
 | `FNOS_COOKIE` | 浏览器 Cookie 请求头整行 | Cookie 方式 | `trim_session=...; other=...` | 空 |
 
@@ -89,15 +90,22 @@ python3 03-apply-multidomain-cert.py --test
 
 ```text
 1. 读入全部变量，去掉末尾 \r\n
-2. 认证模式判定
-   有 FNOS_USER 且 FNOS_PASS → 密码模式（FNOS_SECRET 被忽略）
-   否则有 FNOS_SECRET        → Cookie 模式（getSI + authToken 绑定会话）
-   两者都没有                → 直接退出，提示怎么设
+2. 凭据（缺哪项补哪项）
+   有 FNOS_USER+FNOS_PASS → 密码模式（FNOS_SECRET 被忽略）
+   有 FNOS_SECRET         → Cookie 模式（getSI + authToken 绑定会话）
+   都没有 + 是终端        → 提示输入用户名/密码（密码不回显）
+   都没有 + 非终端        → 报错退出
 3. 连接地址
    命令行 -s 非空 → 用它（完整 wss:// 地址）
-   否则           → wss://127.0.0.1:${FNOS_WS_PORT:-5667}/websocket?type=main
+   FNOS_WS_PORT 非空 → wss://127.0.0.1:<该端口>/websocket?type=main
+   都为空            → 自动探测：
+                       5667 → nginx 配置带 ssl 的 listen → 其余 listen
+                       → /proc/net/tcp{,6} 里 LISTEN 的端口
+                       逐个实测握手（101 / 带 X-Trim-Safe-Code-Challenge / nginx 401、302）
+                       探测不到：终端里问端口，非终端回退 5667
 4. 访问码（可选）
    FNOS_ACCESS_CODE 非空 → 先 GET /access_code_verify 换会话 Cookie，再握手
+   为空且握手被挑战     → 终端里提示输入（输错可重试 3 次），非终端报错
 5. 密码模式登录后，若服务端声明需要 2FA
    FNOS_2FA_CODE 非空   → 直接提交（user.2fa.loginVerify）换 secret
    为空且 stdin 是终端 → 提示输入，输错/过期可重试 3 次
@@ -109,10 +117,11 @@ python3 03-apply-multidomain-cert.py --test
 
 | 场景 | 谁说了算 |
 |---|---|
-| 连接地址 | `-s` > `FNOS_WS_PORT` > 默认 `5667` |
-| 认证方式 | 密码（`FNOS_USER`+`FNOS_PASS`）> `FNOS_SECRET` |
+| 连接地址 | `-s` > `FNOS_WS_PORT` > 自动探测 > 交互询问 > 兜底 `5667` |
+| 认证方式 | 密码（`FNOS_USER`+`FNOS_PASS`）> `FNOS_SECRET` > 交互输入 |
 | 2FA | 只有服务端要求时才用：`FNOS_2FA_CODE` 优先，没设就交互提示；不需要时设了也会被忽略 |
-| 访问码 | 只要 `FNOS_ACCESS_CODE` 非空就先走校验；没开访问码时该值为空 |
+| 访问码 | `FNOS_ACCESS_CODE` 非空就先校验，否则被挑战时交互提示 |
+| 非交互环境 | 任何缺失项都不提示，直接给出「该设哪个变量」的错误 |
 
 ## 四、怎么设置这些变量
 

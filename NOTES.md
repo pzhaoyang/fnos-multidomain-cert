@@ -13,25 +13,24 @@
 
 ## 一、最终如何使用（TL;DR）
 
-### 方式 A：密码自动登录（推荐，零浏览器操作）
+### 方式 A：零配置交互（推荐，直接跑就行）
 
-在 NAS 上（SSH 进去，或直接本机执行）：
+```bash
+# 端口自动探测；用户名/密码、访问码、2FA 验证码都会提示输入
+python3 03-apply-multidomain-cert.py --test        # 只读自检
+python3 03-apply-multidomain-cert.py --list-ddns   # 看 -r 可用的记录
+python3 03-apply-multidomain-cert.py \
+  -d "example.com,*.example.com,www.example.com"
+```
+
+要免交互（cron/管道/远程执行）时再用环境变量：
 
 ```bash
 export FNOS_USER='你的用户名'
 export FNOS_PASS='你的网页登录密码'
-# 仅当 NAS 开了「访问码」时才需要（见坑 13）；没开就别设
-export FNOS_ACCESS_CODE='你的访问码'
-
-# 先测连通（会真实登录一次 + 列出所有证书）
-python3 03-apply-multidomain-cert.py --test
-
-# 先看有哪些 DDNS 记录（-r 用这里的 id；也可以不给 -r 让它自动匹配）
-python3 03-apply-multidomain-cert.py --list-ddns
-
-# 正式申请一张多域名证书（2FA 会提示输入；不写 -r 则按域名自动匹配）
-python3 03-apply-multidomain-cert.py \
-  -d "example.com,*.example.com,www.example.com"
+export FNOS_ACCESS_CODE='你的访问码'   # 开了访问码才需要（坑 13）
+export FNOS_WS_PORT='5667'            # 自动探测不到时才需要
+export FNOS_2FA_CODE='123456'         # 非交互 + 开了 2FA 才需要（坑 14）
 ```
 
 参数说明：
@@ -301,6 +300,25 @@ frame = base64( HMAC-SHA256( json, secret_bytes ) ) + json
      取「记录域名是请求域名后缀」里最长的那条（同区即可，Cloudflare token 按 zone 通用）
 - 注意区分：`3000033 Domain Not Match`（域名与记录不同区）
   vs `3000034 DDNS Record Not Found`（记录 id 根本不存在）
+
+### 坑 16：端口不该问用户 —— 能自动探测出来
+- 起因：脚本默认写死 `5667`，用户改过端口就要手动 `export FNOS_WS_PORT`，
+  换机器又忘，体验很差（“我自己的机器，为啥还要告诉脚本端口”）
+- 结论：**能探测**，而且不必猜配置布局，实测更可靠。探测顺序：
+  1. `5667`（fnOS 默认 HTTPS 端口）
+  2. nginx 配置里带 `ssl` 的 `listen` 端口（扫 `/etc/nginx`、
+     `/usr/trim/nginx`、`/usr/trim/etc/nginx` 等，正则
+     `^\s*listen\s+(?:[0-9.\[\]:]*:)?(\d{2,5})\b([^\n]*)`）
+  3. 其余 nginx `listen` 端口
+  4. `/proc/net/tcp{,6}` 中状态 `0A`（LISTEN）的端口
+- 「这个端口是不是 fnOS 入口」的判据（任一命中即可）：
+  - 握手返回 `101 Switching Protocols` 且带 `websocket`
+  - 响应头带 `X-Trim-Safe-Code-Challenge`（开了访问码，实际是 401）
+  - `Server: nginx` 且返回 `401/302`（登录页/重定向）
+  非 TLS 端口直接排除（`wrap_socket` 失败即跳过，速度很快）
+- 兜底：全都探不到 → 终端里问端口（回车用 5667），非终端回退 5667
+- 教训：**能自测的就别让用户填**。同理，用户名/密码/访问码/2FA 也都改成
+  「环境变量优先，缺了就交互提示」，非交互环境才报错要求设变量
 
 ---
 

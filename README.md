@@ -15,86 +15,96 @@
 
 ## 快速开始
 
-### 1. 先确认端口
-
-脚本默认连 **本机 HTTPS 访问端口 `5667`**（fnOS 系统默认值；HTTP 是 `5666`）。
-判断方法：
-
-- 浏览器能打开 `https://<NAS地址>:<端口>` —— 那个端口就是；
-- 或看 fnOS 网页「安全性 → 访问设置」里的 HTTP/HTTPS 端口。
-
-改过端口就必须告诉脚本，两种方式等价（`-s` 优先）：
+**零配置就能跑**——缺什么，脚本当场问什么：
 
 ```bash
-export FNOS_WS_PORT='5667'      # 只改端口，走本机 loopback
-# 或给完整地址（走域名、反代端口也行）
-python3 03-apply-multidomain-cert.py -s 'wss://127.0.0.1:5667/websocket?type=main' --test
-```
-
-> 端口填错的表现是 `Connection refused` / 超时，**不是** `401` —— 两者别混。
-
-### 2. 设置环境变量
-
-下面两组按需叠加，**没开的功能不要设**：
-
-```bash
-# —— 密码自动登录（推荐）——
-export FNOS_USER='你的用户名'
-export FNOS_PASS='你的网页登录密码'
-
-# —— 按需：NAS 开了「访问码 / 访问保护」——
-export FNOS_ACCESS_CODE='你的访问码'
-
-# 2FA 验证码不用设：脚本会直接提示你输入（见下文）
-```
-
-### 3. 只读自检
-
-```bash
+# 1. 只读自检（真实登录一次 + 列出所有证书，不写任何东西）
 python3 03-apply-multidomain-cert.py --test
+
+# 2. 正式申请
+python3 03-apply-multidomain-cert.py -d "example.com,*.example.com,www.example.com"
 ```
 
-会真实登录一次并列出所有证书，**不做任何写操作**。看到证书列表才算通了。
+典型的交互过程（这些提示都只在需要时出现）：
 
-### 4. 正式申请
+```text
+[0] 探测本机 fnOS 网页端口...
+      检测到端口 8443（nginx 配置 /etc/nginx/conf.d/fnos.conf）
+[0] 未检测到用户名，请输入（也可 export FNOS_USER 免输入）
+      用户名: admin
+      密码（输入时不显示）:
+      该 NAS 开启了「访问码 / 访问保护」
+      请输入访问码（也可 export FNOS_ACCESS_CODE）:
+      密码自动登录中...
+      该账号开启了双重验证（2FA）
+      请输入验证器 App 当前的 6 位验证码:
+      登录成功 uid=1000
+```
+
+### 端口会自动探测
+
+不写 `-s` 时，脚本按下面顺序找本机 fnOS 的 HTTPS 入口，实测到第一个能握手的就用：
+
+1. `5667`（fnOS 默认 HTTPS 端口）
+2. nginx 配置里带 `ssl` 的 `listen` 端口（扫描 `/etc/nginx`、`/usr/trim/nginx` 等）
+3. 其余 nginx `listen` 端口
+4. `/proc/net/tcp{,6}` 里实际处于 LISTEN 的端口
+
+判定「是 fnOS 入口」的依据：握手 `101`，或响应头带 `X-Trim-Safe-Code-Challenge`，
+或 nginx 返回 `401/302`（登录页）。探测不到就问你，回车用默认 `5667`。
+
+想跳过探测就显式指定（`-s` 优先于 `FNOS_WS_PORT`）：
 
 ```bash
-python3 03-apply-multidomain-cert.py \
-  -d "example.com,*.example.com,www.example.com"
+export FNOS_WS_PORT='8443'
+# 或走域名/反代，给完整地址
+python3 03-apply-multidomain-cert.py -s 'wss://127.0.0.1:8443/websocket?type=main' --test
 ```
 
-`-r` 可以省略：脚本会读 NAS 上的 DDNS 记录，按域名后缀自动挑最匹配的那条。
-要自己指定就先查 id：
+> 端口不对的表现是 `Connection refused` / 超时，**不是** `401` —— 两者别混。
+
+### 会提示你输入的三样东西
+
+| 提示 | 触发条件 | 想免输入就设 |
+|---|---|---|
+| 用户名 / 密码 | 没设环境变量 | `FNOS_USER`、`FNOS_PASS` |
+| 访问码 | NAS 开了「访问码 / 访问保护」 | `FNOS_ACCESS_CODE` |
+| 6 位验证码 | 账号开了「双重验证（2FA）」 | `FNOS_2FA_CODE`（30 秒内有效） |
+
+输错/过期都不会中断：访问码和验证码都能重试（最多 3 次）。
+非交互环境（管道、cron，没有终端）不会卡住，而是明确报错让你改用环境变量。
+
+### 参数
+
+| 参数 | 含义 | 默认 |
+|---|---|---|
+| `-d` / `--domains` | 逗号分隔域名列表（可含通配符 `*.x`） | 必填 |
+| `-r` / `--related-ddns-id` | DDNS 记录 id（提供 DNS-01 解析商凭证） | **留空自动匹配**，先校验存在 |
+| `-s` / `--server` | WS 地址，留空自动探测端口 | 自动探测 |
+| `--desc` | 证书备注 | multidomain-cert |
+| `--test` | 只登录 + 列证书，不做写操作 | — |
+| `--list-ddns` | 只列 DDNS 记录后退出 | — |
+
+`-r` 也可以手动指定，先查 id：
 
 ```bash
 python3 03-apply-multidomain-cert.py --list-ddns    # 只读，列出 id / 服务商 / 域名
 python3 03-apply-multidomain-cert.py -d "..." -r 3
 ```
 
-参数：
-
-| 参数 | 含义 | 默认 |
-|---|---|---|
-| `-d` / `--domains` | 逗号分隔域名列表（可含通配符 `*.x`） | 必填 |
-| `-r` / `--related-ddns-id` | DDNS 记录 id（提供 DNS-01 解析商凭证） | **留空自动匹配**，先校验存在 |
-| `-s` / `--server` | WS 地址，留空自动探测 | 本机 HTTPS 端口（`FNOS_WS_PORT` 可指定，默认 5667） |
-| `--desc` | 证书备注 | multidomain-cert |
-| `--test` | 只登录 + 列证书，不做写操作 | — |
-| `--list-ddns` | 只列 DDNS 记录后退出 | — |
-
 依赖：`python3`（标准库）+ `openssl`（fnOS 自带）。
 
 ## 环境变量
 
-脚本只从环境变量读配置。完整说明（优先级、生效逻辑、四种组合、误用排查）见
+**全部可选**——不设就交互提示。完整说明（优先级、生效逻辑、各种组合、误用排查）见
 **[ENV.md](ENV.md)**，速查表：
 
 | 变量 | 作用 | 何时需要 |
 |---|---|---|
-| `FNOS_USER` / `FNOS_PASS` | 网页登录用户名 / 密码 | 密码登录方式（推荐） |
-| `FNOS_WS_PORT` | 本机 HTTPS 端口，默认 `5667` | 端口改过时 |
-| `FNOS_ACCESS_CODE` | 访问码 | NAS 开了「访问码 / 访问保护」时 |
-| `FNOS_2FA_CODE` | 验证器当前 6 位码 | 账号开了「双重验证」时 |
+| `FNOS_USER` / `FNOS_PASS` | 网页登录用户名 / 密码 | 想免去交互输入时 |
+| `FNOS_WS_PORT` | 本机 HTTPS 端口 | 自动探测不到时 |
+| `FNOS_ACCESS_CODE` | 访问码 | 想免去交互输入时 |
+| `FNOS_2FA_CODE` | 验证器当前 6 位码 | 非交互环境（cron/管道） |
 | `FNOS_SECRET` / `FNOS_COOKIE` | 浏览器里的 Secret 与 Cookie | 改用 Cookie 方式时 |
 
 `FNOS_USER`+`FNOS_PASS` 与 `FNOS_SECRET` 二选一；有了密码登录就不用取 Cookie。
@@ -117,18 +127,23 @@ fnOS 的认证分两层，**报错长得很像但原因完全不同**，先看�
 WS 握手失败: HTTP/1.1 401 Unauthorized
 ```
 
-判决依据：响应头里有 `X-Trim-Safe-Code-Challenge: 1`。两种解法：
+判决依据：响应头里有 `X-Trim-Safe-Code-Challenge: 1`。**直接跑脚本它就会问你要访问码**：
+
+```text
+      该 NAS 开启了「访问码 / 访问保护」
+      请输入访问码（也可 export FNOS_ACCESS_CODE）: _
+```
+
+拿到后脚本先 `GET /access_code_verify`（带 `x-access-code: base64(访问码)`）换取
+`os-access-code` 会话 Cookie，再带着 Cookie 建立连接。输错会重新问（最多 3 次）。
 
 ```bash
-# a) 把访问码交给脚本（推荐，保持全自动）
+# 想免输入（或非交互环境）
 export FNOS_ACCESS_CODE='你的访问码'
 ```
 
-脚本会先 `GET /access_code_verify`（带 `x-access-code: base64(访问码)`）换取
-`os-access-code` 会话 Cookie，再带着 Cookie 建立连接。
-
 ```text
-# b) 关闭访问码：fnOS 网页 → 安全性 → 访问设置 → 访问码 → 关闭
+# 也可以直接关掉：fnOS 网页 → 安全性 → 访问设置 → 访问码 → 关闭
 ```
 
 ### 双重验证 2FA（应用层）
@@ -164,10 +179,12 @@ python3 03-apply-multidomain-cert.py --test
 | 现象 | 原因 | 解决 |
 |---|---|---|
 | `Connection refused` / 超时 | 端口不对或服务未开 | 设 `FNOS_WS_PORT` 或用 `-s` 给完整地址 |
-| `WS 握手失败: HTTP/1.1 401`，带 `X-Trim-Safe-Code-Challenge` | 访问码拦截 | 设 `FNOS_ACCESS_CODE`，或关闭访问码 |
+| `探测不到端口，回退到默认 5667` | 没有 nginx 配置可读、也无监听端口命中 | 手动 `export FNOS_WS_PORT='你的端口'` |
+| `WS 握手失败: HTTP/1.1 401`，带 `X-Trim-Safe-Code-Challenge` | 访问码拦截 | 交互运行会提示输入；非交互设 `FNOS_ACCESS_CODE` |
 | `WS 握手失败: HTTP/1.1 401`，无该响应头 | 端口/反代指向了别的服务 | 核对端口与反代规则 |
 | `该账号开启了双重验证（2FA）` / `135168` | 缺验证码或码已过期 | 交互运行让脚本提示输入，或设 `FNOS_2FA_CODE` |
-| `登录失败：用户名或密码错误（131072）` | 用户名或密码不对 | 核对 `FNOS_USER` / `FNOS_PASS` |
+| `需要 2FA 验证码，但当前不是交互终端` | 管道/cron 里无法提示 | 设 `FNOS_2FA_CODE` |
+| `登录失败：用户名或密码错误（131072）` | 用户名或密码不对 | 重新输入，或核对 `FNOS_USER` / `FNOS_PASS` |
 | `errno 65534`（验签失败） | 已连上但会话未绑定 | 改用 Cookie 方式，且 `FNOS_COOKIE` 要取**完整**整行 |
 | `errno 8192` / `3000001` | 参数格式不对 | 确认 `deviceType` 为字符串 `Browser`；2FA 字段不要缺 |
 | `3000034 Cert Apply DDNS Record Not Found` | `-r` 指向的 DDNS 记录不存在 | 省略 `-r` 让脚本自动匹配，或 `--list-ddns` 查真实 id |
